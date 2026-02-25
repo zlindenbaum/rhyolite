@@ -30,6 +30,8 @@ that's used in the frontend module of a typical app.
 module Rhyolite.Frontend.App where
 
 import Control.Applicative
+import Control.Concurrent (ThreadId, killThread, myThreadId)
+import Control.Monad (forM_, when)
 import Control.Monad.Exception
 import Control.Monad.Identity
 import Control.Monad.Primitive
@@ -43,16 +45,19 @@ import qualified Data.ByteString.Lazy as LBS
 import Data.Coerce (coerce)
 import Data.Constraint.Extras
 import Data.Default (Default)
+import Data.IORef (IORef, atomicModifyIORef', newIORef)
+import qualified Data.Map.Strict as MapS
 import qualified Data.Map as Map
-import Data.Semigroup ((<>))
 import Data.Semigroup.Commutative
 import Data.Some
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import Data.Text.Encoding (decodeUtf8)
-import Data.Witherable (Filterable)
+import Witherable (Filterable)
 import GHC.Generics (Generic)
+import Control.Lens ((^.))
+import Language.Javascript.JSaddle (JSM, eval, jsg, js, jss, valToText)
 import Network.URI (URI, parseURI)
 import Obelisk.Frontend.Cookie
 import Obelisk.Route.Frontend (RouteToUrl(..), Routed(..), SetRoute(..))
@@ -60,6 +65,7 @@ import qualified Reflex as R
 import Reflex.Dom.Core hiding (MonadWidget, Request)
 import Reflex.Host.Class
 import Reflex.Time (throttleBatchWithLag)
+import System.IO.Unsafe (unsafePerformIO)
 
 import Rhyolite.Api
 import Rhyolite.WebSocket
@@ -69,13 +75,28 @@ import Obelisk.Route
 import Obelisk.Route.Frontend
 
 #if defined(ghcjs_HOST_OS)
-import GHCJS.DOM.Types (MonadJSM, pFromJSVal)
+import GHCJS.DOM.Types (MonadJSM(..), pFromJSVal)
 #else
 import GHCJS.DOM.Types (MonadJSM(..))
 #endif
 
 import Data.Vessel
 import Data.Vessel.ViewMorphism
+
+{-# NOINLINE wsPreviousThreads #-}
+wsPreviousThreads :: IORef (MapS.Map Text [ThreadId])
+wsPreviousThreads = unsafePerformIO (newIORef MapS.empty)
+
+getSessionId :: MonadJSM m => m Text
+getSessionId = liftJSM' $ do
+  win <- jsg ("window" :: Text)
+  name <- valToText =<< (win ^. js ("name" :: Text))
+  if T.null name
+    then do
+      sid <- valToText =<< eval ("Date.now().toString(36)+Math.random().toString(36).slice(2)" :: Text)
+      win ^. jss ("name" :: Text) sid
+      pure sid
+    else pure name
 
 -- * Viewselectors / Queries
 
@@ -352,7 +373,7 @@ runRhyoliteWidget toWire url child = do
           , _appWebSocket_connected = constDyn False
           }
   rec (dAppWebSocket :: Dynamic t (AppWebSocket t qWire)) <- prerender (return defAppWebSocket) $ do
-          openWebSocket url request'' nubbedVs
+          openWebSocket wsPreviousThreads url request'' nubbedVs
       let (notification :: Event t (QueryResult qWire), response) = (bimap (switch . current) (switch . current) . splitDynPure) $
             ffor dAppWebSocket $ \appWebSocket ->
             ( _appWebSocket_notification appWebSocket
@@ -421,11 +442,24 @@ openWebSocket
      , ToJSON q
      , Request r
      )
-  => Text -- ^ A complete URL
+  => IORef (MapS.Map Text [ThreadId])
+  -> Text -- ^ A complete URL
   -> Event t [TaggedRequest r] -- ^ Outbound requests
   -> Dynamic t q -- ^ Authenticated listen requests (e.g., ViewSelector updates)
   -> m (AppWebSocket t q)
-openWebSocket url request vs = do
+openWebSocket wsPreviousThreads url request vs = do
+#if !defined(ghcjs_HOST_OS)
+  tid <- liftIO myThreadId
+  sid <- getSessionId
+  oldThreads <- liftIO $ atomicModifyIORef' wsPreviousThreads $ \m ->
+    let old = MapS.findWithDefault [] sid m
+        m' = MapS.insert sid [] m
+    in (m', old)
+  forM_ oldThreads $ \oldTid ->
+    when (oldTid /= tid) $ liftIO $ killThread oldTid
+  liftIO $ atomicModifyIORef' wsPreviousThreads $ \m ->
+    (MapS.insertWith (<>) sid [tid] m, ())
+#endif
   rec
     let
 #if defined(ghcjs_HOST_OS)
