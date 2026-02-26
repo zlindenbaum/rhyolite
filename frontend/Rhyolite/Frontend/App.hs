@@ -57,7 +57,9 @@ import Data.Text.Encoding (decodeUtf8)
 import Witherable (Filterable)
 import GHC.Generics (Generic)
 import Control.Lens ((^.))
-import Language.Javascript.JSaddle (JSM, eval, jsg, js, jss, valToText)
+#if !defined(ghcjs_HOST_OS)
+import Language.Javascript.JSaddle (JSM, eval, jsg, js, jss, liftJSM', valToText)
+#endif
 import Network.URI (URI, parseURI)
 import Obelisk.Frontend.Cookie
 import Obelisk.Route.Frontend (RouteToUrl(..), Routed(..), SetRoute(..))
@@ -87,16 +89,46 @@ import Data.Vessel.ViewMorphism
 wsPreviousThreads :: IORef (MapS.Map Text [ThreadId])
 wsPreviousThreads = unsafePerformIO (newIORef MapS.empty)
 
+-- | Return a stable per-browser-session id for JSaddle session scoping.
+-- Prefer 'window.name' when available, otherwise fall back to sessionStorage
+-- (then localStorage) so iOS Safari works even without 'window.name'.
+#if defined(ghcjs_HOST_OS)
+getSessionId :: Monad m => m Text
+getSessionId = pure "ghcjs"
+#else
+liftJSMCompat :: MonadJSM m => JSM a -> m a
+liftJSMCompat = liftJSM'
+
 getSessionId :: MonadJSM m => m Text
-getSessionId = liftJSM' $ do
+getSessionId = liftJSMCompat $ do
   win <- jsg ("window" :: Text)
   name <- valToText =<< (win ^. js ("name" :: Text))
-  if T.null name
-    then do
-      sid <- valToText =<< eval ("Date.now().toString(36)+Math.random().toString(36).slice(2)" :: Text)
+  if not (T.null name)
+    then pure name
+    else do
+      stored <- valToText =<< eval (T.unlines
+        [ "(function() {"
+        , "  try {"
+        , "    var v = window.sessionStorage && window.sessionStorage.getItem('jsaddle-session-id');"
+        , "    if (v) return v;"
+        , "  } catch(e) {}"
+        , "  try {"
+        , "    var v2 = window.localStorage && window.localStorage.getItem('jsaddle-session-id');"
+        , "    if (v2) return v2;"
+        , "  } catch(e) {}"
+        , "  return '';"
+        , "})()"
+        ])
+      sid <- if T.null stored
+        then do
+          s <- valToText =<< eval ("Date.now().toString(36)+Math.random().toString(36).slice(2)" :: Text)
+          _ <- eval ("try { window.sessionStorage.setItem('jsaddle-session-id', '" <> s <> "'); } catch(e) {}" :: Text)
+          _ <- eval ("try { window.localStorage.setItem('jsaddle-session-id', '" <> s <> "'); } catch(e) {}" :: Text)
+          pure s
+        else pure stored
       win ^. jss ("name" :: Text) sid
       pure sid
-    else pure name
+#endif
 
 -- * Viewselectors / Queries
 
